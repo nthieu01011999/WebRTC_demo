@@ -3,12 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <iostream>
 #include <iomanip>
 #include <cstdio>
 #include <vector>
-
 #include <algorithm>
 #include <future>
 #include <iostream>
@@ -19,37 +17,29 @@
 #include <unordered_map>
 #include <chrono>
 #include <pthread.h>
-
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <atomic>
-
 #include "app.h"
 #include "app_data.h"
 #include "app_config.h"
 #include "app_dbg.h"
 #include "datachannel_hdl.h"
-
 #include "task_list.h"
-
-// #include "dispatchqueue.hpp"
 #include "helpers.hpp"
 #include "rtc/rtc.hpp"
 #include "json.hpp"
 #include "stream.hpp"
-
 #ifdef BUILD_ARM_VVTK
 #include "h26xsource.hpp"
 #include "audiosource.hpp"
 #endif
-
-// #include "mtce_audio.hpp"
 #include "parser_json.h"
 #include "utils.h"
 
 #define CLIENT_SIGNALING_MAX 20
-#define CLIENT_MAX			 10
+#define CLIENT_MAX 10
 
 using namespace rtc;
 using namespace std;
@@ -57,109 +47,64 @@ using namespace chrono_literals;
 using namespace chrono;
 using json = nlohmann::json;
 
+// Global variables
 q_msg_t gw_task_webrtc_mailbox;
-// std::shared_ptr<PeerConnection> pc = nullptr;  // AK_MSG_NULL has been did with #define AK_MSG_NULL ((ak_msg_t *)0)
 std::shared_ptr<WebSocket> globalWebSocket;
-shared_ptr<Client> createPeerConnection(const Configuration &rtcConfig, weak_ptr<WebSocket> wws, const string& id);
-
-static int8_t loadWsocketSignalingServerConfigFile(string &wsUrl);
 static Configuration rtcConfig;
-static int8_t loadIceServersConfigFile(Configuration &rtcConfig);
+std::unordered_map<std::string, std::shared_ptr<PeerConnection>> peerConnections;
+atomic<bool> isConnected(false);
 
+// Function declarations
+shared_ptr<Client> createPeerConnection(const Configuration &rtcConfig, weak_ptr<WebSocket> wws, const string& id);
+static int8_t loadWsocketSignalingServerConfigFile(string &wsUrl);
+static int8_t loadIceServersConfigFile(Configuration &rtcConfig);
 void handleWebSocketMessage(const std::string& message, std::shared_ptr<WebSocket> ws);
 void handleClientRequest(const std::string& clientId, std::shared_ptr<WebSocket> ws);
 void handleAnswer(const std::string& id, const json& message);
-
-std::unordered_map<std::string, std::shared_ptr<PeerConnection>> peerConnections;
 static void addToStream(shared_ptr<Client> client, bool isAddingVideo);
 static void startStream();
 static shared_ptr<Stream> createStream(void);
-static shared_ptr<ClientTrackData> addVideo(const shared_ptr<PeerConnection> pc, const uint8_t payloadType, const uint32_t ssrc, const string cname, const string msid,
-											const function<void(void)> onOpen);
-static shared_ptr<ClientTrackData> addAudio(const shared_ptr<PeerConnection> pc, const uint8_t payloadType, const uint32_t ssrc, const string cname, const string msid,
-											const function<void(void)> onOpen, std::string id);
+static shared_ptr<ClientTrackData> addVideo(const shared_ptr<PeerConnection> pc, const uint8_t payloadType, const uint32_t ssrc, const string cname, const string msid, const function<void(void)> onOpen);
+static shared_ptr<ClientTrackData> addAudio(const shared_ptr<PeerConnection> pc, const uint8_t payloadType, const uint32_t ssrc, const string cname, const string msid, const function<void(void)> onOpen, std::string id);
 void periodicClientCheck();
 void startPeriodicCheck();
 
+void initializeWebSocketServer(const std::string &wsUrl);
 
+//done
 void *gw_task_webrtc_entry(void *) {
-	ak_msg_t *msg = AK_MSG_NULL;
+    ak_msg_t *msg = AK_MSG_NULL;
 
-	wait_all_tasks_started();
-	APP_DBG("[STARTED] gw_task_webrtc_entry\n");
+    wait_all_tasks_started();
+    APP_DBG("[STARTED] gw_task_webrtc_entry\n");
+
     if (loadIceServersConfigFile(rtcConfig) != APP_CONFIG_SUCCESS) {
         APP_PRINT("Failed to load ICE servers configuration.\n");
         return AK_MSG_NULL;  // Exit if configuration fails
     }
 
     rtcConfig.disableAutoNegotiation = false;  // Set localDescription automatically
-	
-    /* init websocket */
-    auto ws = make_shared<WebSocket>(); // init poll service and threadpool = 4
-	weak_ptr<WebSocket> wws = ws;
-    // Guard flag to check WebSocket connection status
+
+    auto ws = make_shared<WebSocket>();
+    weak_ptr<WebSocket> wws = ws;
     atomic<bool> isConnected(false);
 
-    ws->onOpen([&]() {
-        isConnected.store(true);
-        APP_PRINT("WebSocket connected, signaling ready\n");
-        timer_remove_attr(GW_TASK_WEBRTC_ID, GW_WEBRTC_TRY_CONNECT_SOCKET_REQ);
-    });
+    initializeWebSocketServer("ws://sig.espitek.com:8089/" + mtce_getSerialInfo());
 
-    ws->onClosed([&]() {
-        isConnected.store(false);
-        APP_PRINT("WebSocket closed\n");
-        timer_set(GW_TASK_WEBRTC_ID, GW_WEBRTC_TRY_CONNECT_SOCKET_REQ, GW_WEBRTC_TRY_CONNECT_SOCKET_INTERVAL, TIMER_ONE_SHOT);
-    });
+    std::this_thread::sleep_for(1s);
 
-    ws->onError([&](const string &error) {
-        isConnected.store(false);
-        APP_PRINT("WebSocket connection failed: %s\n", error.c_str());
-        // Depending on your application logic, you might want to attempt a reconnection here.
-    });
-
-	ws->onMessage([&](variant<binary, string> data) {
-		APP_PRINT("WebSocket connection @ ws->onMessage\n");
-		if (holds_alternative<string>(data)) {
-			string msg = get<string>(data);
-			APP_DBG("%s\n", msg.data());
-			handleWebSocketMessage(msg, ws);  // Pass the message to the handler
-			// If needed, you can post the message here as well, depending on your application's architecture.
-		}
-	});
-
-    std::string wsUrl;
-
-
-    // Debugging output
-    wsUrl = "ws://sig.espitek.com:8089/" + mtce_getSerialInfo();
-    std::cout << "Attempting to connect WebSocket server at URL: " << wsUrl << std::endl;
-
-    if (loadWsocketSignalingServerConfigFile(wsUrl) != APP_CONFIG_SUCCESS || wsUrl.empty()) {
-        APP_PRINT("Failed to load WebSocket URL configuration or URL is empty.\n");
-        return AK_MSG_NULL;  // Exit if configuration fails or URL is empty
-    }
-    // Attempt to connect
-    ws->open(wsUrl);
-
-    // Wait a bit to see if the connection succeeds (or modify based on your app logic)
-    std::this_thread::sleep_for(1s); // Adjust the timing as necessary
-
-    // Check the connection status
     if (isConnected.load()) {
         APP_PRINT("WebSocket is successfully connected.\n");
     } else {
         APP_PRINT("WebSocket connection failed or is still in progress.\n");
     }
 
-// #endif
-	APP_DBG("[STARTED] gw_task_webrtc_entry\n");
     startPeriodicCheck();
-	while (1) {
-		/* get messge */
-		msg = ak_msg_rev(GW_TASK_WEBRTC_ID);
 
-		switch (msg->header->sig) {
+    while (1) {
+        msg = ak_msg_rev(GW_TASK_WEBRTC_ID);
+
+        switch (msg->header->sig) {
         case GW_WEBRTC_ERASE_CLIENT_REQ: {
             APP_DBG_SIG("GW_WEBRTC_ERASE_CLIENT_REQ\n");
             string id((char *)msg->header->payload);
@@ -169,245 +114,34 @@ void *gw_task_webrtc_entry(void *) {
             clients.erase(id);
             unlockMutexListClients();
             Client::setSignalingStatus(false);
+        } break;
 
-            // printAllClients();
-		} break;
-
-		case GW_WEBRTC_ICE_CANDIDATE: {
-
-		} break;
-
-		case GW_WEBRTC_ON_MESSAGE_CONTROL_DATACHANNEL_REQ: {
-			APP_DBG_SIG("GW_WEBRTC_ON_MESSAGE_CONTROL_DATACHANNEL_REQ\n");
-			try {
-				json message = json::parse(string((char *)msg->header->payload, msg->header->len));
-				string id	 = message["ClientId"].get<string>();
-				string data	 = message["Data"].get<string>();
-				string resp	 = "";
-				APP_DBG("client id: %s, msg: %s\n", id.c_str(), data.c_str());
-				onDataChannelHdl(id, data, resp);
-				sendMsgControlDataChannel(id, resp);
-			}
-			catch (const exception &error) {
-				APP_DBG("%s\n", error.what());
-			}
-			APP_DBG("end datachannel handle\n");
-		} break;
-			
-		default:
-		break;
-		}
-
-		/* free message */
-		ak_msg_free(msg);
-	}
-
-    // rtcConfig.disableAutoNegotiation = false;
-    // pc = make_shared<PeerConnection>(rtcConfig);
-
-	return (void *)0;
-}
-
-int8_t loadIceServersConfigFile(Configuration &rtcConfig) {
-	rtcServersConfig_t rtcServerCfg;
-	int8_t ret = configGetRtcServers(&rtcServerCfg);
-	try {
-		if (ret == APP_CONFIG_SUCCESS) {
-			rtcConfig.iceServers.clear();
-
-			APP_DBG("List stun server:\n");
-			string url = "";
-			int size   = rtcServerCfg.arrStunServerUrl.size();
-			for (int idx = 0; idx < size; idx++) {
-				url = rtcServerCfg.arrStunServerUrl.at(idx);
-				APP_DBG("\t[%d] url: %s\n", idx + 1, url.c_str());
-				if (url != "") {
-					rtcConfig.iceServers.emplace_back(url);
-				}
-			}
-			APP_DBG("\n");
-			APP_DBG("List turn server:\n");
-			size = rtcServerCfg.arrTurnServerUrl.size();
-			for (int idx = 0; idx < size; idx++) {
-				url = rtcServerCfg.arrTurnServerUrl.at(idx);
-				APP_DBG("\t[%d] url: %s\n", idx + 1, url.c_str());
-				if (url != "") {
-					rtcConfig.iceServers.emplace_back(url);
-				}
-			}
-			APP_DBG("\n");
-		}
-	}
-	catch (const exception &error) {
-		APP_DBG("loadIceServersConfigFile %s\n", error.what());
-		ret = APP_CONFIG_ERROR_DATA_INVALID;
-	}
-
-	return ret;
-}
-
-
-int8_t loadWsocketSignalingServerConfigFile(string &wsUrl) {
-    rtcServersConfig_t rtcServerCfg;
-    int8_t ret = configGetRtcServers(&rtcServerCfg);
-    
-    APP_PRINT("[DEBUG] Loading WebSocket Signaling Server Config...\n");
-    
-    if (ret == APP_CONFIG_SUCCESS) {
-        APP_PRINT("[DEBUG] Successfully retrieved RTC server configuration.\n");
-        
-        wsUrl.clear();
-        // if (!rtcServerCfg.wSocketServerCfg.empty()) {
-		if (rtcServerCfg.wSocketServerCfg 	!= "") {
-            wsUrl = rtcServerCfg.wSocketServerCfg + "/" + mtce_getSerialInfo();
-            //wsUrl = rtcServerCfg.wSocketServerCfg + "/c02i24010000008"; 
-            APP_PRINT("[DEBUG] WebSocket URL constructed: %s\n", wsUrl.c_str());
-        } else {
-            APP_PRINT("[ERROR] WebSocket server configuration is empty.\n");
-        }
-    } else {
-        APP_PRINT("[ERROR] Failed to retrieve RTC server configuration. Error code: %d\n", ret);
-    }
-    
-    return ret;
-}
-
-// "Exchange of Offer and Answer"
-void handleWebSocketMessage(const std::string& message, std::shared_ptr<WebSocket> ws) {
-
-    APP_DBG("[WebSocket Message Received]: %s\n", message.c_str());
-    if (ws && ws->isOpen()) {
-        // It is safe to use 'ws' here
-    } else {
-        APP_DBG("WebSocket is not open or not available.\n");
-        // Handle the error or attempt to reconnect
-    }
-
-    try {
-        json messageJson = json::parse(message);
-        APP_DBG("Parsed WebSocket Message: %s\n", messageJson.dump(4).c_str()); // Use pretty printing for better readability
-
-        auto typeIt = messageJson.find("Type");
-        if (typeIt != messageJson.end()) {
-            string type = typeIt->get<string>();
-            APP_DBG("Processing Message Type: %s\n", type.c_str());
-
-            if (type == "request") {
-                auto clientIdIt = messageJson.find("ClientId");
-                if (clientIdIt != messageJson.end()) {
-                    string clientId = clientIdIt->get<string>();
-                    APP_DBG("Handling request for Client ID: %s\n", clientId.c_str());
-
-                    // Handle the client's request, e.g., create a new peer connection
-                    handleClientRequest(clientId, ws);
-                } else {
-                    APP_DBG("Error: ClientId not found in request message\n");
-                }
-            } else if (type == "candidate") {
-				APP_DBG("[Type: candidate]\n");
-                string sdp = messageJson["sdp"].get<string>();
-                string mid = messageJson["mid"].get<string>();
-                APP_DBG("Adding ICE Candidate: sdp=%s, mid=%s\n", sdp.c_str(), mid.c_str());
-                
-                // pc->addRemoteCandidate(Candidate(sdp, mid));
-            } 
-			else if (type == "answer") {
-				auto clientIdIt = messageJson.find("ClientId");
-				if (clientIdIt != messageJson.end()) {
-					string clientId = clientIdIt->get<string>();
-					APP_DBG("Received answer for client ID: %s\n", clientId.c_str());
-					auto pcIter = peerConnections.find(clientId);
-					if (pcIter != peerConnections.end()) {
-						auto& pc = pcIter->second;
-						if (pc->localDescription() && pc->localDescription()->type() == Description::Type::Offer) {
-							handleAnswer(clientId, messageJson);
-						} else {
-							APP_DBG("Received answer in an unexpected state.\n");
-						}
-					} else {
-						APP_DBG("No PeerConnection found for client ID: %s\n", clientId.c_str());
-					}
-				}
-			}
-        } else {
-            APP_DBG("Error: Message type not specified\n");
-        }
-    } catch (const json::exception& e) {
-        APP_DBG("[JSON Parsing Error] %s\n", e.what());
-    }
-
-    // Continue to post the message to the task or message queue
-    task_post_dynamic_msg(GW_TASK_WEBRTC_ID, GW_WEBRTC_SIGNALING_SOCKET_REQ, (uint8_t *)message.data(), message.length() + 1);
-}
-
-void handleClientRequest(const std::string& clientId, std::shared_ptr<WebSocket> ws) {
-    APP_DBG("Initiating peer connection for Client ID: %s\n", clientId.c_str());
-
-    // Check client limits
-    if (Client::totalClientsConnectSuccess <= CLIENT_MAX && clients.size() <= CLIENT_SIGNALING_MAX) {
-        Client::setSignalingStatus(true);
-        APP_DBG("Client limits OK, proceeding to create peer connection\n");
-
-        std::shared_ptr<Client> newClient = createPeerConnection(rtcConfig, make_weak_ptr(ws), clientId); //each id each peer following
-		peerConnections[clientId] = newClient->peerConnection;
-        clients[clientId] = newClient;
-        APP_DBG("peerConnectionspeerConnectionspeerConnectionspeerConnections\n");
-        lockMutexListClients();
-        clients.emplace(clientId, newClient);
-        // printAllClients();
-        auto cl = clients.at(clientId);
-        cl->startTimeoutConnect();
-        APP_DBG("Started timeout connect for client: %s\n", clientId.c_str());
-        unlockMutexListClients();
-        Client::setSignalingStatus(false);
-    } else {
-        APP_DBG("Reached max client limit. Cannot handle new request for client: %s\n", clientId.c_str());
-    }
-}
-
-void handleAnswer(const std::string& id, const json& message) {
-    auto pcIter = peerConnections.find(id);
-    if (pcIter == peerConnections.end()) {
-        APP_DBG("No PeerConnection found for client ID: %s\n", id.c_str());
-        return;
-    }
-	std::shared_ptr<PeerConnection>& pc = pcIter->second;
-    if (!pc) {
-        APP_DBG("PeerConnection pointer is null, cannot handle answer for client ID: %s\n", id.c_str());
-        // Depending on your application logic, you may want to reconnect, throw an exception, or handle this error appropriately.
-        return;
-    }
-    auto sdp = message["Sdp"].get<string>();
-    auto desRev = Description(sdp, "answer");
-
-    if (pc->remoteDescription().has_value()) {
-        // Existing remote description, check ICE credentials
-        if (desRev.iceUfrag().has_value() && desRev.icePwd().has_value() &&
-            desRev.iceUfrag().value() == pc->remoteDescription().value().iceUfrag().value() &&
-            desRev.icePwd().value() == pc->remoteDescription().value().icePwd().value()) {
-
-            // Add remote candidates if any
-            auto remoteCandidates = desRev.extractCandidates();
-            for (const auto& candidate : remoteCandidates) {
-                APP_DBG("Adding ICE Candidate: %s\n", candidate.candidate().c_str());
-                pc->addRemoteCandidate(candidate);
+        case GW_WEBRTC_ON_MESSAGE_CONTROL_DATACHANNEL_REQ: {
+            APP_DBG_SIG("GW_WEBRTC_ON_MESSAGE_CONTROL_DATACHANNEL_REQ\n");
+            try {
+                json message = json::parse(string((char *)msg->header->payload, msg->header->len));
+                string id = message["ClientId"].get<string>();
+                string data = message["Data"].get<string>();
+                string resp = "";
+                APP_DBG("client id: %s, msg: %s\n", id.c_str(), data.c_str());
+                onDataChannelHdl(id, data, resp);
+                sendMsgControlDataChannel(id, resp);
+            } catch (const exception &error) {
+                APP_DBG("%s\n", error.what());
             }
-        } else {
-            APP_DBG("ICE credentials mismatch for client ID: %s\n", id.c_str());
-            // Handle error, possibly throw an exception
-        }
-    } else {
-        APP_DBG("Setting new remote description for client ID: %s\n", id.c_str());
-        try {
-            pc->setRemoteDescription(desRev);
-            APP_DBG("New session description set for client ID: %s\n", id.c_str());
-        } catch (const exception& e) {
-            APP_DBG("Error setting remote description for client ID: %s: %s\n", id.c_str(), e.what());
-            // Handle error, possibly throw an exception
-        }
-    }
-}
+        } break;
 
+        default:
+            APP_DBG_SIG("[DEBUG] Unknown message signal received: %d\n", msg->header->sig);
+            break;
+        }
+
+        ak_msg_free(msg);
+    }
+
+    return (void *)0;
+}
+//done
 
 void addToStream(shared_ptr<Client> client, bool isAddingVideo) {
 	if (client->getState() == Client::State::Waiting) {
@@ -888,4 +622,194 @@ void startPeriodicCheck() {
             std::this_thread::sleep_for(std::chrono::seconds(3)); // Check every 10 seconds
         }
     }).detach();
+}
+
+//WebSocket Initialization and Management
+void initializeWebSocketServer(const std::string &wsUrl) {
+    globalWebSocket = std::make_shared<WebSocket>();
+
+    globalWebSocket->onOpen([&]() {
+        isConnected.store(true);
+        APP_DBG("WebSocket connected, signaling ready\n");
+        timer_remove_attr(GW_TASK_WEBRTC_ID, GW_WEBRTC_TRY_CONNECT_SOCKET_REQ);
+    });
+
+    globalWebSocket->onClosed([&]() {
+        isConnected.store(false);
+        APP_DBG("WebSocket closed\n");
+        timer_set(GW_TASK_WEBRTC_ID, GW_WEBRTC_TRY_CONNECT_SOCKET_REQ, GW_WEBRTC_TRY_CONNECT_SOCKET_INTERVAL, TIMER_ONE_SHOT);
+    });
+
+    globalWebSocket->onError([&](const string &error) {
+        isConnected.store(false);
+        APP_DBG("WebSocket connection failed: %s\n", error.c_str());
+    });
+
+    globalWebSocket->onMessage([&](variant<binary, string> data) {
+        APP_DBG("WebSocket connection @ ws->onMessage\n");
+        if (holds_alternative<string>(data)) {
+            string msg = get<string>(data);
+            APP_DBG("%s\n", msg.data());
+            handleWebSocketMessage(msg, globalWebSocket);
+        }
+    });
+
+    globalWebSocket->open(wsUrl);
+}
+
+//Configuration Loading
+//done
+int8_t loadIceServersConfigFile(Configuration &rtcConfig) {
+    rtcServersConfig_t rtcServerCfg;
+    int8_t ret = configGetRtcServers(&rtcServerCfg);
+    try {
+        if (ret == APP_CONFIG_SUCCESS) {
+            rtcConfig.iceServers.clear();
+
+            APP_DBG("List stun server:\n");
+            for (const auto& url : rtcServerCfg.arrStunServerUrl) {
+                if (!url.empty()) {
+                    rtcConfig.iceServers.emplace_back(url);
+                    APP_DBG("\turl: %s\n", url.c_str());
+                }
+            }
+            APP_DBG("\nList turn server:\n");
+            for (const auto& url : rtcServerCfg.arrTurnServerUrl) {
+                if (!url.empty()) {
+                    rtcConfig.iceServers.emplace_back(url);
+                    APP_DBG("\turl: %s\n", url.c_str());
+                }
+            }
+            APP_DBG("\n");
+        }
+    } catch (const exception &error) {
+        APP_DBG("loadIceServersConfigFile %s\n", error.what());
+        ret = APP_CONFIG_ERROR_DATA_INVALID;
+    }
+    return ret;
+}
+
+int8_t loadWsocketSignalingServerConfigFile(string &wsUrl) {
+    rtcServersConfig_t rtcServerCfg;
+    int8_t ret = configGetRtcServers(&rtcServerCfg);
+
+    if (ret == APP_CONFIG_SUCCESS) {
+        wsUrl.clear();
+        if (!rtcServerCfg.wSocketServerCfg.empty()) {
+            wsUrl = rtcServerCfg.wSocketServerCfg + "/" + mtce_getSerialInfo();
+            APP_DBG("[DEBUG] WebSocket URL constructed: %s\n", wsUrl.c_str());
+        } else {
+            APP_DBG("[ERROR] WebSocket server configuration is empty.\n");
+        }
+    } else {
+        APP_DBG("[ERROR] Failed to retrieve RTC server configuration. Error code: %d\n", ret);
+    }
+
+    return ret;
+}
+//done
+
+//WebSocket Message Handling
+void handleWebSocketMessage(const std::string& message, std::shared_ptr<WebSocket> ws) {
+    APP_DBG("[WebSocket Message Received]: %s\n", message.c_str());
+    if (ws && ws->isOpen()) {
+        APP_DBG("safe to use\n");
+    } else {
+        APP_DBG("WebSocket is not open or not available.\n");
+    }
+
+    try {
+        json messageJson = json::parse(message);
+        APP_DBG("Parsed WebSocket Message: %s\n", messageJson.dump(4).c_str());
+
+        auto typeIt = messageJson.find("Type");
+        if (typeIt != messageJson.end()) {
+            string type = typeIt->get<string>();
+
+            if (type == "request") {
+                auto clientIdIt = messageJson.find("ClientId");
+                if (clientIdIt != messageJson.end()) {
+                    string clientId = clientIdIt->get<string>();
+                    handleClientRequest(clientId, ws);
+                } else {
+                    APP_DBG("Error: ClientId not found in request message\n");
+                }
+            } else if (type == "candidate") {
+                APP_DBG("[Type: candidate]\n");
+                string sdp = messageJson["sdp"].get<string>();
+                string mid = messageJson["mid"].get<string>();
+                APP_DBG("Adding ICE Candidate: sdp=%s, mid=%s\n", sdp.c_str(), mid.c_str());
+                // pc->addRemoteCandidate(Candidate(sdp, mid));
+            } else if (type == "answer") {
+                auto clientIdIt = messageJson.find("ClientId");
+                if (clientIdIt != messageJson.end()) {
+                    string clientId = clientIdIt->get<string>();
+                    handleAnswer(clientId, messageJson);
+                }
+            }
+        } else {
+            APP_DBG("Error: Message type not specified\n");
+        }
+    } catch (const json::exception& e) {
+        APP_DBG("[JSON Parsing Error] %s\n", e.what());
+    }
+}
+
+//Client Request Handling
+void handleClientRequest(const std::string& clientId, std::shared_ptr<WebSocket> ws) {
+    APP_DBG("Initiating peer connection for Client ID: %s\n", clientId.c_str());
+
+    if (Client::totalClientsConnectSuccess <= CLIENT_MAX && clients.size() <= CLIENT_SIGNALING_MAX) {
+        Client::setSignalingStatus(true);
+        std::shared_ptr<Client> newClient = createPeerConnection(rtcConfig, make_weak_ptr(ws), clientId);
+        peerConnections[clientId] = newClient->peerConnection;
+        clients[clientId] = newClient;
+
+        lockMutexListClients();
+        clients.emplace(clientId, newClient);
+        auto cl = clients.at(clientId);
+        cl->startTimeoutConnect();
+        APP_DBG("Started timeout connect for client: %s\n", clientId.c_str());
+        unlockMutexListClients();
+        Client::setSignalingStatus(false);
+    } else {
+        APP_DBG("Reached max client limit. Cannot handle new request for client: %s\n", clientId.c_str());
+    }
+}
+
+void handleAnswer(const std::string& id, const json& message) {
+    auto pcIter = peerConnections.find(id);
+    if (pcIter == peerConnections.end()) {
+        APP_DBG("No PeerConnection found for client ID: %s\n", id.c_str());
+        return;
+    }
+    std::shared_ptr<PeerConnection>& pc = pcIter->second;
+    if (!pc) {
+        APP_DBG("PeerConnection pointer is null, cannot handle answer for client ID: %s\n", id.c_str());
+        return;
+    }
+    auto sdp = message["Sdp"].get<string>();
+    auto desRev = Description(sdp, "answer");
+
+    if (pc->remoteDescription().has_value()) {
+        if (desRev.iceUfrag().has_value() && desRev.icePwd().has_value() &&
+            desRev.iceUfrag().value() == pc->remoteDescription().value().iceUfrag().value() &&
+            desRev.icePwd().value() == pc->remoteDescription().value().icePwd().value()) {
+
+            auto remoteCandidates = desRev.extractCandidates();
+            for (const auto& candidate : remoteCandidates) {
+                APP_DBG("Adding ICE Candidate: %s\n", candidate.candidate().c_str());
+                pc->addRemoteCandidate(candidate);
+            }
+        } else {
+            APP_DBG("ICE credentials mismatch for client ID: %s\n", id.c_str());
+        }
+    } else {
+        try {
+            pc->setRemoteDescription(desRev);
+            APP_DBG("New session description set for client ID: %s\n", id.c_str());
+        } catch (const exception& e) {
+            APP_DBG("Error setting remote description for client ID: %s: %s\n", id.c_str(), e.what());
+        }
+    }
 }
