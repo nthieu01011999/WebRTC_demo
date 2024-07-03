@@ -301,203 +301,179 @@ shared_ptr<Stream> createStream() {
     return stream;
 }
 
-
 shared_ptr<Client> createPeerConnection(const Configuration &rtcConfig, weak_ptr<WebSocket> wws, const string& id) {
     if (wws.expired()) {
         APP_DBG("WebSocket pointer expired before creating PeerConnection for client ID: %s\n", id.c_str());
         return nullptr;
-    } else {
-        APP_DBG("[WebSocket: ALIVE]\n");
     }
 
-    // Adding debug information for rtcConfig
+    auto ws = wws.lock();
+    APP_DBG("[WebSocket: ALIVE]\n");
+
     APP_DBG("RTC Configuration for Client ID: %s\n", id.c_str());
-    APP_DBG("ICE Servers Configuration:\n");
     for (const auto& server : rtcConfig.iceServers) {
-        APP_DBG("\tHostname: %s, Port: %d\n", server.hostname.c_str(), server.port);
-        APP_DBG("\tUsername: %s, Password: %s\n", server.username.c_str(), server.password.c_str());
-        APP_DBG("\tRelayType: %d\n", static_cast<int>(server.relayType));
+        APP_DBG("\tHostname: %s, Port: %d, Username: %s, Password: %s, RelayType: %d\n",
+                server.hostname.c_str(), server.port, server.username.c_str(), server.password.c_str(), static_cast<int>(server.relayType));
     }
-
-    APP_DBG("Transport Policy: %d\n", static_cast<int>(rtcConfig.iceTransportPolicy));
-    APP_DBG("Certificate Type: %d\n", static_cast<int>(rtcConfig.certificateType));
-    APP_DBG("ICE TCP Enabled: %d\n", rtcConfig.enableIceTcp);
-    APP_DBG("ICE UDP Mux Enabled: %d\n", rtcConfig.enableIceUdpMux);
-    APP_DBG("Auto Negotiation Disabled: %d\n", rtcConfig.disableAutoNegotiation);
-    APP_DBG("Media Transport Forced: %d\n", rtcConfig.forceMediaTransport);
-    APP_DBG("Port Range: %d to %d\n", rtcConfig.portRangeBegin, rtcConfig.portRangeEnd);
-    APP_DBG("MTU: %lu\n", rtcConfig.mtu.value_or(0));
-    APP_DBG("Max Message Size: %lu\n", rtcConfig.maxMessageSize.value_or(0));
 
     APP_DBG("Attempting to create PeerConnection...\n");
-    auto pc = make_shared<PeerConnection>(rtcConfig);
-    if (!pc) {
-        APP_DBG("[ERROR] Failed to create PeerConnection for Client ID: %s\n", id.c_str());
-        return nullptr;
+    shared_ptr<PeerConnection> pc;
+    try {
+        pc = make_shared<PeerConnection>(rtcConfig);
+        if (!pc) {
+            throw runtime_error("Failed to instantiate PeerConnection.");
+        }
+    } catch (const std::exception& e) {
+        APP_DBG("[ERROR] Failed to create PeerConnection for Client ID: %s: %s\n", id.c_str(), e.what());
+        return nullptr; 
     }
     APP_DBG("PeerConnection successfully created for Client ID: %s.\n", id.c_str());
 
     auto client = make_shared<Client>(pc);
     client->setId(id);
 
+    pc->onStateChange([id](PeerConnection::State state) {
+        APP_DBG("State: %d\n", static_cast<int>(state));
+        if (state == PeerConnection::State::Disconnected || state == PeerConnection::State::Failed || state == PeerConnection::State::Closed) {
+            APP_DBG("call erase client from lib\n");
+            systemTimer.add(milliseconds(100),
+                            [id](CppTime::timer_id) { task_post_dynamic_msg(GW_TASK_WEBRTC_ID, GW_WEBRTC_ERASE_CLIENT_REQ, (uint8_t *)id.c_str(), id.length() + 1); });
+        }
+    });
 
-	pc->onStateChange([id](PeerConnection::State state) {
-		APP_DBG("State: %d\n", (int)state);
-		if (state == PeerConnection::State::Disconnected || state == PeerConnection::State::Failed || state == PeerConnection::State::Closed) {
-			// remove disconnected client
-			APP_DBG("call erase client from lib\n");
-			systemTimer.add(milliseconds(100),
-							[id](CppTime::timer_id) { task_post_dynamic_msg(GW_TASK_WEBRTC_ID, GW_WEBRTC_ERASE_CLIENT_REQ, (uint8_t *)id.c_str(), id.length() + 1); });
-		}
-	});
+    pc->onGatheringStateChange([wpc = make_weak_ptr(pc), id, wws](PeerConnection::GatheringState state) {
+        APP_DBG("[onGatheringStateChange] %d for Client ID: %s\n", static_cast<int>(state), id.c_str());
+        if (state == PeerConnection::GatheringState::Complete) {
+            auto pc = wpc.lock();
+            if (!pc) {
+                APP_DBG("PeerConnection weak_ptr expired for client: %s.\n", id.c_str());
+                return;
+            }
 
-	pc->onGatheringStateChange([wpc = make_weak_ptr(pc), id, wws](PeerConnection::GatheringState state) {
-	APP_DBG("[onGatheringStateChange] %d for Client ID: %s\n", static_cast<int>(state), id.c_str());
-	APP_DBG("Gathering State: %d\n", static_cast<int>(state));
-	if (state == PeerConnection::GatheringState::Complete) {
-		auto pc = wpc.lock();
-		if (!pc) {
-			APP_DBG("PeerConnection weak_ptr expired for client: %s.\n", id.c_str());
-			return;
-		}
+            auto description = pc->localDescription();
+            if (!description) {
+                APP_DBG("Failed to get local description for client: %s.\n", id.c_str());
+                return;
+            }
 
-		auto description = pc->localDescription();
-		if (!description) {
-			APP_DBG("Failed to get local description for client: %s.\n", id.c_str());
-			return;
-		}
+            json message = {
+                {"ClientId", id},
+                {"Type", description->typeString()},
+                {"Sdp", string(description.value())}
+            };
 
-		json message = {
-			{"ClientId", id},
-			{"Type", description->typeString()},
-			{"Sdp", string(description.value())}
-		};
+            APP_DBG("[BEFORE] Sent SDP to WebSocket: %s\n", message.dump().c_str());
 
-		APP_DBG("[BEFORE] Sent SDP to WebSocket: %s\n", message.dump().c_str());
+            if (auto ws = wws.lock()) {
+                try {
+                    if (ws->isOpen()) {
+                        ws->send(message.dump());
+                        APP_DBG("Sent SDP to WebSocket for client: %s.\n", id.c_str());
+                    } else {
+                        APP_DBG("WebSocket is not open for client: %s.\n", id.c_str());
+                    }
+                } catch (const std::exception& e) {
+                    APP_DBG("Exception while sending message for client: %s: %s\n", id.c_str(), e.what());
+                }
+            } else {
+                APP_DBG("WebSocket weak_ptr expired for client: %s.\n", id.c_str());
+            }
+        }
+    });
 
-		// Check if the WebSocket pointer is still valid
-		if (auto ws = wws.lock()) {
-			try {
-				// Check if the WebSocket connection is open
-				if (ws->isOpen()) { // Hypothetical function to check connection status
-					APP_DBG("WebSocket is alive, sending message\n");
-					ws->send(message.dump());
-					APP_DBG("Sent SDP to WebSocket for client: %s.\n", id.c_str());
-				} else {
-					APP_DBG("WebSocket is not open for client: %s.\n", id.c_str());
-					// Implement reconnection or error handling logic here
-				}
-			} catch (const std::exception& e) {
-				APP_DBG("Exception while sending message for client: %s: %s\n", id.c_str(), e.what());
-				// Implement error handling logic here
-			}
-		} else {
-			APP_DBG("WebSocket weak_ptr expired for client: %s.\n", id.c_str());
-			// Implement reconnection or error handling logic here
-		}
-	}
-	});
+    pc->onLocalCandidate([id, wpc = make_weak_ptr(pc)](const Candidate &candidate) {
+        APP_DBG("Entered onLocalCandidate callback for client: %s.\n", id.c_str());
+        if (wpc.expired()) {
+            APP_DBG("PeerConnection weak pointer expired for client: %s.\n", id.c_str());
+            return;
+        }
+        
+        auto lockedPc = wpc.lock();
+        if (!lockedPc) {
+            APP_DBG("Failed to lock PeerConnection for client: %s.\n", id.c_str());
+            return;
+        }
+        
+        APP_DBG("PeerConnection locked successfully for client: %s.\n", id.c_str());
+        
+        json message = {
+            {"Type", "candidate"},
+            {"Candidate", candidate.candidate()},
+            {"SdpMid", candidate.mid()},
+            {"ClientId", id}
+        };
+        std::cout << message.dump(4) << std::endl;
 
+        std::string message_str = message.dump();
+        APP_DBG("JSON message constructed for client: %s, message: %s\n", id.c_str(), message_str.c_str());
 
+        try {
+            task_post_dynamic_msg(GW_TASK_HELLO_ID, GW_WEBRTC_ICE_CANDIDATE, (uint8_t *)message_str.data(), message_str.length() + 1);
+            APP_DBG("ICE candidate message posted successfully for client: %s.\n", id.c_str());
+        } catch (const std::exception& e) {
+            APP_DBG("Exception caught while posting ICE candidate message for client: %s: %s\n", id.c_str(), e.what());
+        }
+    });
 
-	pc->onLocalCandidate([id, wpc = make_weak_ptr(pc)](const Candidate &candidate) {
-		APP_DBG("Entered onLocalCandidate callback for client: %s.\n", id.c_str());
-		if (wpc.expired()) {
-			APP_DBG("PeerConnection weak pointer expired for client: %s.\n", id.c_str());
-			return;
-		}
-		
-		auto lockedPc = wpc.lock();
-		if (!lockedPc) {
-			APP_DBG("Failed to lock PeerConnection for client: %s.\n", id.c_str());
-			return;
-		}
-		
-		APP_DBG("PeerConnection locked successfully for client: %s.\n", id.c_str());
-		
-		json message = {
-			{"Type", "candidate"},
-			{"Candidate", candidate.candidate()},
-			{"SdpMid", candidate.mid()},
-			{"ClientId", id}
-		};
-		std::cout << message.dump(4) << std::endl;
+    client->video = addVideo(pc, 102, 1, "VideoStream", "Stream", [id, wc = make_weak_ptr(client)]() {
+        APP_DBG("[addVideo] open addVideo label\n");
+        if (auto c = wc.lock()) {
+            addToStream(c, true);
+        }
+        APP_DBG("Video from %s opened\n", id.c_str());
+    });
 
-		std::string message_str = message.dump();
-		APP_DBG("JSON message constructed for client: %s, message: %s\n", id.c_str(), message_str.c_str());
+    client->audio = addAudio(pc, 8, 2, "AudioStream", "Stream", [id, wc = make_weak_ptr(client)]() {
+        APP_DBG("[addAudio] open addAudio label\n");
+        if (auto c = wc.lock()) {
+            addToStream(c, false);
+        }
+        APP_DBG("Audio from %s opened\n", id.c_str());
+    }, id);
 
-		try {
-			task_post_dynamic_msg(GW_TASK_HELLO_ID, GW_WEBRTC_ICE_CANDIDATE, (uint8_t *)message_str.data(), message_str.length() + 1);
-			APP_DBG("ICE candidate message posted successfully for client: %s.\n", id.c_str());
-		} catch (const std::exception& e) {
-			APP_DBG("Exception caught while posting ICE candidate message for client: %s: %s\n", id.c_str(), e.what());
-		}
-	});
+    auto dc = pc->createDataChannel("control");
+    dc->onOpen([id, wcl = make_weak_ptr(client)]() {
+        APP_DBG("[createDataChannel] open channel label\n");
+        if (auto cl = wcl.lock()) {
+            auto dc = cl->dataChannel.value();
+            APP_DBG("open channel label: %s success\n", dc->label().c_str());
+            cl->removeTimeoutConnect();
+            cl->mIsSignalingOk = true;
+            if (++Client::totalClientsConnectSuccess > CLIENT_MAX) {
+                APP_DBG("Client::totalClientsConnectSuccess > %d\n", CLIENT_MAX);
+                FATAL("RTC", 0x01);
+            }
+            APP_DBG("total client: %d\n", Client::totalClientsConnectSuccess.load());
 
-	client->video = addVideo(pc, 102, 1, "VideoStream", "Stream", [id, wc = make_weak_ptr(client)]() {
-		APP_DBG("[addVideo] open addVideo label\n");
-		if (auto c = wc.lock()) {
-			addToStream(c, true);
-		}
-		APP_DBG("Video from %s opened\n", id.c_str());
-	});
+            auto pc = cl->peerConnection;
+            Candidate iceCam, iceApp;
+            if (pc->getSelectedCandidatePair(&iceCam, &iceApp)) {
+                APP_DBG("local candidate selected: %s, transport type: %d\n", iceCam.candidate().c_str(), iceCam.transportType());
+                APP_DBG("remote candidate selected: %s, transport type: %d\n", iceApp.candidate().c_str(), iceApp.transportType());
+            } else {
+                APP_DBG("get selected candidate pair failed\n");
+            }
+        }
+    });
 
-	client->audio = addAudio(pc, 8, 2, "AudioStream", "Stream", [id, wc = make_weak_ptr(client)]() {
-		APP_DBG("[addAudio] open addAudio label\n");
-		if (auto c = wc.lock()) {
-			addToStream(c, false);
-		}
-		APP_DBG("Audio from %s opened\n", id.c_str());
-	}, id);
+    dc->onMessage([id](auto data) {
+        if (holds_alternative<string>(data)) {
+            json dataRev = {
+                {"ClientId", id},
+                {"Data", get<string>(data)}
+            };
+            task_post_dynamic_msg(GW_TASK_WEBRTC_ID, GW_WEBRTC_ON_MESSAGE_CONTROL_DATACHANNEL_REQ, (uint8_t *)dataRev.dump().c_str(), dataRev.dump().length() + 1);
+        } else {
+            APP_DBG("Binary message from %s received, size= %d\n", id.c_str(), get<rtc::binary>(data).size());
+        }
+    });
 
-	auto dc = pc->createDataChannel("control");
-	dc->onOpen([id, wcl = make_weak_ptr(client)]() {
-		APP_DBG("[createDataChannel] open channel label\n");
-		if (auto cl = wcl.lock()) {
-			auto dc = cl->dataChannel.value();
-			APP_DBG("open channel label: %s success\n", dc->label().c_str());
-			// dc->send("Hello from " + mtce_getSerialInfo());
-			APP_DBG("remove timeout connect\n");
-			cl->removeTimeoutConnect();
-			cl->mIsSignalingOk = true;
-			if (++Client::totalClientsConnectSuccess > CLIENT_MAX) {
-				APP_DBG("Client::totalClientsConnectSuccess > %d\n", CLIENT_MAX);
-				FATAL("RTC", 0x01);
-			}
-			APP_DBG("total client: %d\n", Client::totalClientsConnectSuccess.load());
+    dc->onBufferedAmountLow([id]() { APP_DBG("clientId %s send done\n", id.c_str()); });
+    client->dataChannel = dc;
 
-			auto pc = cl->peerConnection;
-			Candidate iceCam, iceApp;
-			if (pc->getSelectedCandidatePair(&iceCam, &iceApp)) {
-				APP_DBG("local candidate selected: %s, transport type: %d\n", iceCam.candidate().c_str(), iceCam.transportType());
-				APP_DBG("remote candidate selected: %s, transport type: %d\n", iceApp.candidate().c_str(), iceApp.transportType());
-			}
-			else {
-				APP_DBG("get selected candidate pair failed\n");
-			}
-		}
-	});
+    return client;
+}
 
-	dc->onMessage([id](auto data) {
-		// data holds either string or rtc::binaryL
-		if (holds_alternative<string>(data)) {
-			json dataRev = {
-				{"ClientId", id			   },
-				  {"Data",	   get<string>(data)}
-			 };
-			task_post_dynamic_msg(GW_TASK_WEBRTC_ID, GW_WEBRTC_ON_MESSAGE_CONTROL_DATACHANNEL_REQ, (uint8_t *)dataRev.dump().c_str(), dataRev.dump().length() + 1);
-		}
-		else {
-			APP_DBG("Binary message from %s received, size= %d\n", id.c_str(), get<rtc::binary>(data).size());
-		}
-	});
-
-	dc->onBufferedAmountLow([id]() { APP_DBG("clientId %s send done\n", id.c_str()); });
-	client->dataChannel = dc;
-
-	// pc->setLocalDescription();
-	return client;
-};
 
 shared_ptr<ClientTrackData> addVideo(const shared_ptr<PeerConnection> pc, const uint8_t payloadType, const uint32_t ssrc, const string cname, const string msid, const function<void(void)> onOpen) {
     auto video = Description::Video(cname, Description::Direction::SendOnly);
