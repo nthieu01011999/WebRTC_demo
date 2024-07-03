@@ -93,6 +93,12 @@
         "vvtk_def.h": "c",
         "vvtk_wifi.h": "c",
         "vvtk_video.h": "c",
-        "test_video_api.h": "c"
+        "test_video_api.h": "c",
+        "stdio.h": "c",
+        "unistd.h": "c",
+        "test_io_api.h": "c",
+        "basic.h": "c",
+        "vvtk_camera.h": "c",
+        "vvtk_event.h": "c"
     }
 }

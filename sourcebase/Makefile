@@ -216,7 +216,7 @@ endif
 .PHONY: cp
 copy: $(OBJ_DIR)/$(NAME_MODULE)
  
-	sudo cp $(OBJ_DIR)/$(NAME_MODULE) /mnt/nfs_share/test/
+	sudo cp $(OBJ_DIR)/$(NAME_MODULE) /mnt/nfs_share/agent/
 	
  
 

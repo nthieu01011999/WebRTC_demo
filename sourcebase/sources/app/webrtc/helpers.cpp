@@ -378,3 +378,15 @@ void Client::startTimeoutConnect() {
 		task_post_dynamic_msg(GW_TASK_WEBRTC_ID, GW_WEBRTC_CHECK_CLIENT_CONNECTED_REQ, (uint8_t *)id.c_str(), id.length() + 1);
 	}));
 }
+
+bool Client::isAlive() {
+    // Check if the peer connection is still active
+    if (_peerConnection) {
+        auto state = _peerConnection->state();
+        if (state == rtc::PeerConnection::State::Connected || 
+            state == rtc::PeerConnection::State::Connecting) {
+            return true;
+        }
+    }
+    return false;
+}

@@ -69,7 +69,7 @@ public:
 
 	Client(std::shared_ptr<rtc::PeerConnection> pc);
 	~Client();
-
+	bool isAlive();
 	void setState(State state);
 	State getState();
 

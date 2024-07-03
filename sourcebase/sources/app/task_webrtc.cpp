@@ -58,7 +58,7 @@ using namespace chrono;
 using json = nlohmann::json;
 
 q_msg_t gw_task_webrtc_mailbox;
-std::shared_ptr<PeerConnection> pc = nullptr;  // AK_MSG_NULL has been did with #define AK_MSG_NULL ((ak_msg_t *)0)
+// std::shared_ptr<PeerConnection> pc = nullptr;  // AK_MSG_NULL has been did with #define AK_MSG_NULL ((ak_msg_t *)0)
 std::shared_ptr<WebSocket> globalWebSocket;
 shared_ptr<Client> createPeerConnection(const Configuration &rtcConfig, weak_ptr<WebSocket> wws, const string& id);
 
@@ -78,12 +78,15 @@ static shared_ptr<ClientTrackData> addVideo(const shared_ptr<PeerConnection> pc,
 											const function<void(void)> onOpen);
 static shared_ptr<ClientTrackData> addAudio(const shared_ptr<PeerConnection> pc, const uint8_t payloadType, const uint32_t ssrc, const string cname, const string msid,
 											const function<void(void)> onOpen, std::string id);
+void periodicClientCheck();
+void startPeriodicCheck();
+
 
 void *gw_task_webrtc_entry(void *) {
 	ak_msg_t *msg = AK_MSG_NULL;
 
 	wait_all_tasks_started();
-	APP_DBG("[STARTED_1] gw_task_webrtc_entry\n");
+	APP_DBG("[STARTED] gw_task_webrtc_entry\n");
     if (loadIceServersConfigFile(rtcConfig) != APP_CONFIG_SUCCESS) {
         APP_PRINT("Failed to load ICE servers configuration.\n");
         return AK_MSG_NULL;  // Exit if configuration fails
@@ -151,7 +154,7 @@ void *gw_task_webrtc_entry(void *) {
 
 // #endif
 	APP_DBG("[STARTED] gw_task_webrtc_entry\n");
-
+    startPeriodicCheck();
 	while (1) {
 		/* get messge */
 		msg = ak_msg_rev(GW_TASK_WEBRTC_ID);
@@ -200,7 +203,7 @@ void *gw_task_webrtc_entry(void *) {
 	}
 
     // rtcConfig.disableAutoNegotiation = false;
-    pc = make_shared<PeerConnection>(rtcConfig);
+    // pc = make_shared<PeerConnection>(rtcConfig);
 
 	return (void *)0;
 }
@@ -257,6 +260,7 @@ int8_t loadWsocketSignalingServerConfigFile(string &wsUrl) {
         // if (!rtcServerCfg.wSocketServerCfg.empty()) {
 		if (rtcServerCfg.wSocketServerCfg 	!= "") {
             wsUrl = rtcServerCfg.wSocketServerCfg + "/" + mtce_getSerialInfo();
+            //wsUrl = rtcServerCfg.wSocketServerCfg + "/c02i24010000008"; 
             APP_PRINT("[DEBUG] WebSocket URL constructed: %s\n", wsUrl.c_str());
         } else {
             APP_PRINT("[ERROR] WebSocket server configuration is empty.\n");
@@ -267,7 +271,7 @@ int8_t loadWsocketSignalingServerConfigFile(string &wsUrl) {
     
     return ret;
 }
-// /
+
 // "Exchange of Offer and Answer"
 void handleWebSocketMessage(const std::string& message, std::shared_ptr<WebSocket> ws) {
 
@@ -343,11 +347,11 @@ void handleClientRequest(const std::string& clientId, std::shared_ptr<WebSocket>
     if (Client::totalClientsConnectSuccess <= CLIENT_MAX && clients.size() <= CLIENT_SIGNALING_MAX) {
         Client::setSignalingStatus(true);
         APP_DBG("Client limits OK, proceeding to create peer connection\n");
-		// auto ws = make_shared<WebSocket>(); // This should be managed globally or outside this function
-        // weak_ptr<WebSocket> wws = ws; // Convert shared_ptr to weak_ptr
-        // // Create a new peer connection for the client
+
         std::shared_ptr<Client> newClient = createPeerConnection(rtcConfig, make_weak_ptr(ws), clientId); //each id each peer following
 		peerConnections[clientId] = newClient->peerConnection;
+        clients[clientId] = newClient;
+        APP_DBG("peerConnectionspeerConnectionspeerConnectionspeerConnections\n");
         lockMutexListClients();
         clients.emplace(clientId, newClient);
         // printAllClients();
@@ -565,19 +569,43 @@ shared_ptr<Stream> createStream() {
 
 
 shared_ptr<Client> createPeerConnection(const Configuration &rtcConfig, weak_ptr<WebSocket> wws, const string& id) {
-	if (wws.expired()) {
-		APP_DBG("WebSocket pointer expired before creating PeerConnection for client ID: %s\n", id.c_str());
-		// Handle the expired case (e.g., throw an exception or return a nullptr)
-		return nullptr;
-	}
-	else
-		APP_DBG("[ALIVE]\n");
+    if (wws.expired()) {
+        APP_DBG("WebSocket pointer expired before creating PeerConnection for client ID: %s\n", id.c_str());
+        return nullptr;
+    } else {
+        APP_DBG("[WebSocket: ALIVE]\n");
+    }
 
-	APP_DBG("call createPeerConnection()\n");
-	auto pc = make_shared<PeerConnection>(rtcConfig);
-	APP_DBG("PeerConnection created successfully.\n"); // Add this line to confirm creation
-	auto client = make_shared<Client>(pc);
-	client->setId(id);
+    // Adding debug information for rtcConfig
+    APP_DBG("RTC Configuration for Client ID: %s\n", id.c_str());
+    APP_DBG("ICE Servers Configuration:\n");
+    for (const auto& server : rtcConfig.iceServers) {
+        APP_DBG("\tHostname: %s, Port: %d\n", server.hostname.c_str(), server.port);
+        APP_DBG("\tUsername: %s, Password: %s\n", server.username.c_str(), server.password.c_str());
+        APP_DBG("\tRelayType: %d\n", static_cast<int>(server.relayType));
+    }
+
+    APP_DBG("Transport Policy: %d\n", static_cast<int>(rtcConfig.iceTransportPolicy));
+    APP_DBG("Certificate Type: %d\n", static_cast<int>(rtcConfig.certificateType));
+    APP_DBG("ICE TCP Enabled: %d\n", rtcConfig.enableIceTcp);
+    APP_DBG("ICE UDP Mux Enabled: %d\n", rtcConfig.enableIceUdpMux);
+    APP_DBG("Auto Negotiation Disabled: %d\n", rtcConfig.disableAutoNegotiation);
+    APP_DBG("Media Transport Forced: %d\n", rtcConfig.forceMediaTransport);
+    APP_DBG("Port Range: %d to %d\n", rtcConfig.portRangeBegin, rtcConfig.portRangeEnd);
+    APP_DBG("MTU: %lu\n", rtcConfig.mtu.value_or(0));
+    APP_DBG("Max Message Size: %lu\n", rtcConfig.maxMessageSize.value_or(0));
+
+    APP_DBG("Attempting to create PeerConnection...\n");
+    auto pc = make_shared<PeerConnection>(rtcConfig);
+    if (!pc) {
+        APP_DBG("[ERROR] Failed to create PeerConnection for Client ID: %s\n", id.c_str());
+        return nullptr;
+    }
+    APP_DBG("PeerConnection successfully created for Client ID: %s.\n", id.c_str());
+
+    auto client = make_shared<Client>(pc);
+    client->setId(id);
+
 
 	pc->onStateChange([id](PeerConnection::State state) {
 		APP_DBG("State: %d\n", (int)state);
@@ -590,6 +618,7 @@ shared_ptr<Client> createPeerConnection(const Configuration &rtcConfig, weak_ptr
 	});
 
 	pc->onGatheringStateChange([wpc = make_weak_ptr(pc), id, wws](PeerConnection::GatheringState state) {
+	APP_DBG("[onGatheringStateChange] %d for Client ID: %s\n", static_cast<int>(state), id.c_str());
 	APP_DBG("Gathering State: %d\n", static_cast<int>(state));
 	if (state == PeerConnection::GatheringState::Complete) {
 		auto pc = wpc.lock();
@@ -830,4 +859,33 @@ shared_ptr<ClientTrackData> addAudio(const shared_ptr<PeerConnection> pc, const 
 
     auto trackData = make_shared<ClientTrackData>(track, srReporter);
     return trackData;
+}
+
+
+
+
+void periodicClientCheck() {
+    for (const auto& clientPair : clients) {
+        auto client = clientPair.second;
+        if (client) {
+            if (!client->isAlive()) {
+                APP_DBG("Client with ID: %s is no longer alive.\n", clientPair.first.c_str());
+                APP_DBG("PeerConnection state for Client ID: %s is not active.\n", clientPair.first.c_str());
+                // Handle client disconnection or cleanup
+            } else {
+                APP_DBG("Client with ID: %s is still alive.\n", clientPair.first.c_str());
+            }
+        } else {
+            APP_DBG("Client with ID: %s is null.\n", clientPair.first.c_str());
+        }
+    }
+}
+
+void startPeriodicCheck() {
+    std::thread([]() {
+        while (true) {
+            periodicClientCheck();
+            std::this_thread::sleep_for(std::chrono::seconds(3)); // Check every 10 seconds
+        }
+    }).detach();
 }

@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
-#include </usr/include/CUnit/Basic.h>
+#include <CUnit/Basic.h>
 #include "vvtk_video.h"
 
 void testAssert_video_config_value(void)
