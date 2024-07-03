@@ -1,4 +1,4 @@
 #!/bin/bash
 git add .
-git commit -m"CreatePeerConnection"
+git commit -m"Done"
 git push origin master
